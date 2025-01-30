@@ -1,9 +1,11 @@
 # Audio-System
 
 ### File-Division
-`approach-1_1.py` is for the approach-1 but it makes splits/chunks as per user defined timespan in real time
-`approach-1_2.py` is for the approach-1 but it makes splits/chunks as per user defined time duration and divides the chunks based on conclusion of sentences/words in real time
-`approach-2.py` is according to the approach 2nd as mentioned in scope of work file
+`approach-1_1.py` is for the approach-1 but it makes splits/chunks as per user defined timespan in real time.
+
+`approach-1_2.py` is for the approach-1 but it makes splits/chunks as per user defined time duration and divides the chunks based on conclusion of sentences/words in real time.
+
+`approach-2.py` is according to the approach 2nd as mentioned in scope of work file.
 
 ## **Installation Instructions**
 
