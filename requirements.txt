@@ -1,0 +1,5 @@
+sounddevice
+pydub
+openai-whisper
+ffmpeg-python
+librosa
