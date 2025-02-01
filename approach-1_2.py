@@ -196,14 +196,25 @@ class AudioCapturer:
         self.processing_thread.start()
         
         if self.os_type == 'Windows':
-            system_stream = sd.InputStream(
-                device=self.system_device,
-                channels=self.system_channels,
-                samplerate=self.sample_rate,
-                callback=self.system_callback,
-                blocksize=self.chunk_size,
-                extra_settings={'wasapi_loopback': True}
-            )
+            try:
+                system_stream = sd.InputStream(
+                    device=self.system_device,
+                    channels=self.system_channels,
+                    samplerate=self.sample_rate,
+                    callback=self.system_callback,
+                    blocksize=self.chunk_size,
+                    wasapi_loopback=True  # Direct parameter instead of extra_settings
+                )
+            except Exception as e:
+                print(f"Failed to initialize WASAPI loopback: {e}")
+                print("Falling back to default input...")
+                system_stream = sd.InputStream(
+                    device=self.system_device,
+                    channels=self.system_channels,
+                    samplerate=self.sample_rate,
+                    callback=self.system_callback,
+                    blocksize=self.chunk_size
+                )
         else:
             system_stream = sd.InputStream(
                 device=self.system_device,
@@ -227,7 +238,8 @@ class AudioCapturer:
     def stop(self):
         self.is_recording = False
         self.is_processing = False
-        self.processing_thread.join()
+        if hasattr(self, 'processing_thread'):
+            self.processing_thread.join()
         with self.lock:
             if len(self.original_buffer) > 0:
                 self.save_segment(self.original_buffer)
