@@ -16,6 +16,7 @@ class AudioCapturer:
         self.output_folder = "audio_chunks"
         self.os_type = platform.system()
         print(f"Detected OS: {self.os_type}")
+        
         while True:
             try:
                 self.chunk_duration = float(input("Enter chunk duration in seconds (recommended: 1-10): "))
@@ -38,46 +39,79 @@ class AudioCapturer:
         
         self.chunk_number = 0
     
-    def select_audio_devices(self):
-        """Let user manually select input devices"""
+    def get_microphone_devices(self):
+        """Filter and return only microphone devices"""
         devices = sd.query_devices()
-        print("\nAvailable audio devices:")
+        mic_devices = []
+        
         for i, device in enumerate(devices):
-            print(f"{i}: {device['name']} (inputs: {device['max_input_channels']}, outputs: {device['max_output_channels']})")
+            if device['max_input_channels'] > 0:
+                mic_keywords = ['mic', 'microphone', 'input', 'headset']
+                device_name = device['name'].lower()
+                if any(keyword in device_name for keyword in mic_keywords) or device.get('default_input', False):
+                    mic_devices.append((i, device))
+        
+        return mic_devices
+    
+    def get_system_audio_device(self):
+        """Automatically select system audio device based on OS"""
+        devices = sd.query_devices()
+        
+        if self.os_type == 'Windows':
+            for i, device in enumerate(devices):
+                if device['max_input_channels'] > 0:
+                    name = device['name'].lower()
+                    if 'stereo mix' in name or 'what u hear' in name or 'loopback' in name:
+                        return i, device
+
+            default_output = sd.default.device[1]
+            if default_output is not None:
+                return default_output, devices[default_output]
+        
+        elif self.os_type == 'Darwin':  
+            for i, device in enumerate(devices):
+                if device['max_input_channels'] > 0:
+                    name = device['name'].lower()
+                    if 'blackhole' in name or 'soundflower' in name:
+                        return i, device
+        
+        elif self.os_type == 'Linux':
+            for i, device in enumerate(devices):
+                if device['max_input_channels'] > 0:
+                    name = device['name'].lower()
+                    if 'monitor' in name or 'pulse' in name or 'pipewire' in name:
+                        return i, device
+        
+        default_input = sd.default.device[0]
+        return default_input, devices[default_input]
+    
+    def select_audio_devices(self):
+        """Let user select microphone and automatically set system audio"""
+        mic_devices = self.get_microphone_devices()
+        
+        print("\nAvailable microphones:")
+        for i, (device_id, device) in enumerate(mic_devices):
+            print(f"{i}: {device['name']}")
         
         while True:
             try:
-                mic_id = int(input("\nEnter the number for your microphone device: "))
-                if 0 <= mic_id < len(devices):
-                    if devices[mic_id]['max_input_channels'] > 0:
-                        self.mic_device = mic_id
-                        self.mic_channels = min(2, devices[mic_id]['max_input_channels'])
-                        print(f"Selected microphone: {devices[mic_id]['name']}")
-                        break
-                    else:
-                        print("Error: Selected device has no input channels. Please choose an input device.")
-                else:
-                    print("Error: Invalid device number. Please try again.")
-            except ValueError:
-                print("Error: Please enter a valid number.")
-        
-        while True:
-            try:
-                system_id = int(input("\nEnter the number for your system audio device: "))
-                if 0 <= system_id < len(devices):
-                    self.system_device = system_id
-                    self.system_channels = min(2, max(devices[system_id]['max_input_channels'], 
-                                                    devices[system_id]['max_output_channels']))
-                    print(f"Selected system audio: {devices[system_id]['name']}")
+                selection = int(input("\nEnter the number for your microphone: "))
+                if 0 <= selection < len(mic_devices):
+                    device_id, device = mic_devices[selection]
+                    self.mic_device = device_id
+                    self.mic_channels = min(2, device['max_input_channels'])
+                    print(f"Selected microphone: {device['name']}")
                     break
                 else:
-                    print("Error: Invalid device number. Please try again.")
+                    print("Error: Invalid selection. Please try again.")
             except ValueError:
                 print("Error: Please enter a valid number.")
         
-        print(f"\nSelected devices:")
-        print(f"Microphone: {devices[self.mic_device]['name']} ({self.mic_channels} channels)")
-        print(f"System Audio: {devices[self.system_device]['name']} ({self.system_channels} channels)")
+        system_id, system_device = self.get_system_audio_device()
+        self.system_device = system_id
+        self.system_channels = min(2, max(system_device['max_input_channels'], 
+                                        system_device.get('max_output_channels', 0)))
+        print(f"\nAutomatically selected system audio: {system_device['name']}")
         
     def mic_callback(self, indata, frames, time, status):
         """Callback for microphone data"""
@@ -99,11 +133,23 @@ class AudioCapturer:
             stereo_data = indata
         self.system_queue.put(stereo_data.copy())
         
+    def normalize_audio(self, audio_data):
+        """Normalize audio data to prevent clipping"""
+        max_val = np.max(np.abs(audio_data))
+        if max_val > 0:
+            return audio_data / max_val
+        return audio_data
+        
     def save_audio_chunk(self, mic_data, system_data):
         """Save mixed audio data to a WAV file"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{self.output_folder}/chunk_{timestamp}_{self.chunk_number}.wav"
-        mixed_data = (system_data * 0.7 + mic_data * 0.3)
+        mic_normalized = self.normalize_audio(mic_data)
+        system_normalized = self.normalize_audio(system_data)
+        mixed_data = (system_normalized * 0.5 + mic_normalized * 0.5)  
+        gain = 1.0 
+        mixed_data = mixed_data * gain
+        mixed_data = np.clip(mixed_data, -1.0, 1.0)
         mixed_int = (mixed_data * 32767).astype(np.int16)
         
         with wave.open(filename, 'w') as wav_file:
