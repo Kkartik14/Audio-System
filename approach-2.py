@@ -18,11 +18,11 @@ class AudioCapturer:
         self.sample_rate = sample_rate
         self.is_recording = False
         self.is_processing = False
-        self.output_folder = "audio_segments"
+        self.base_folder = "audio_segments"
         self.os_type = platform.system()
-        self.segment_counter = 1
+        self.segment_counter = {'mic': 1, 'system': 1, 'mixed': 1}
 
-        os.makedirs(self.output_folder, exist_ok=True)
+        os.makedirs(self.base_folder, exist_ok=True)
         
         self.chunk_size = int(self.sample_rate * self.chunk_duration)
         self.processing_queue = queue.Queue()
@@ -30,9 +30,35 @@ class AudioCapturer:
         self.get_stream_preference()
         self.select_audio_devices()
         self.whisper_model = whisper.load_model("tiny")
-        self.original_buffer = np.empty((0, 2), dtype=np.float32)
+        
+        self.buffers = {
+            'mic': np.empty((0, 2), dtype=np.float32),
+            'system': np.empty((0, 2), dtype=np.float32),
+            'mixed': np.empty((0, 2), dtype=np.float32)
+        }
         self.lock = threading.Lock()
         self.get_split_preferences()
+        
+        self.setup_directories()
+
+    def setup_directories(self):
+        if self.process_stream == 'both':
+            self.output_folders = {
+                'mic': os.path.join(self.base_folder, 'microphone'),
+                'system': os.path.join(self.base_folder, 'system'),
+                'mixed': os.path.join(self.base_folder, 'mixed')
+            }
+        elif self.process_stream == 'mic':
+            self.output_folders = {
+                'mic': self.base_folder
+            }
+        else:  # system
+            self.output_folders = {
+                'system': self.base_folder
+            }
+            
+        for folder in self.output_folders.values():
+            os.makedirs(folder, exist_ok=True)
 
     def get_stream_preference(self):
         while True:
@@ -46,7 +72,7 @@ class AudioCapturer:
     def get_split_preferences(self):
         while True:
             try:
-                self.min_split = float(input("Enter minimum split time (seconds, default 5): "))
+                self.min_split = float(input("Enter minimum split time (seconds, default 5): ") or "5")
                 if self.min_split <= 0:
                     print("Minimum split time must be greater than zero.")
                 else:
@@ -56,7 +82,7 @@ class AudioCapturer:
 
         while True:
             try:
-                self.max_split = float(input("Enter maximum split time (seconds, default 8): "))
+                self.max_split = float(input("Enter maximum split time (seconds, default 8): ") or "8")
                 if self.max_split <= self.min_split:
                     print("Maximum split time must be greater than the minimum.")
                 else:
@@ -81,7 +107,7 @@ class AudioCapturer:
             if device['max_output_channels'] > 0:
                 return default_output, min(2, device['max_output_channels'])
                 
-        else:
+        else:  # MacOS or Linux
             virtual_devices = ['blackhole', 'soundflower']
             for i, device in enumerate(devices):
                 if any(v in device['name'].lower() for v in virtual_devices):
@@ -173,52 +199,69 @@ class AudioCapturer:
                             continue
                         break
 
-                if self.process_stream == 'both':
-                    mixed = self.mix_audio(mic_data, system_data)
-                elif self.process_stream == 'mic':
-                    mixed = mic_data if mic_data.shape[1] == 2 else np.column_stack((mic_data, mic_data))
-                elif self.process_stream == 'system':
-                    mixed = system_data if system_data.shape[1] == 2 else np.column_stack((system_data, system_data))
-                
-                mixed = np.clip(mixed, -1.0, 1.0)
-                
                 with self.lock:
-                    self.original_buffer = np.vstack((self.original_buffer, mixed))
-                    current_duration = len(self.original_buffer) / self.sample_rate
-                    if current_duration < 0.5:  
-                        continue
-                    mono_audio = np.mean(self.original_buffer, axis=1)
-                    resampled = librosa.resample(
-                        mono_audio.astype(np.float32),
-                        orig_sr=self.sample_rate,
-                        target_sr=16000
-                    )
-
-                    result = self.whisper_model.transcribe(resampled, fp16=False)
-                    segments = result['segments']
-
-                    split_time = None
-                    for seg in reversed(segments):
-                        end = seg['end'] * (self.sample_rate / 16000)
-                        if self.min_split <= end <= self.max_split:
-                            split_time = end
-                            break
-
-                    if not split_time and current_duration >= self.max_split:
-                        split_time = self.max_split
-                    
-                    if split_time:
-                        split_sample = int(split_time * self.sample_rate)
-                        split_sample = min(split_sample, len(self.original_buffer))
-                        self.save_segment(self.original_buffer[:split_sample])
-                        self.original_buffer = self.original_buffer[split_sample:]
+                    if self.process_stream == 'both':
+                        if mic_data is not None:
+                            mic_stereo = mic_data if mic_data.shape[1] == 2 else np.column_stack((mic_data, mic_data))
+                            self.buffers['mic'] = np.vstack((self.buffers['mic'], mic_stereo))
                         
+                        if system_data is not None:
+                            system_stereo = system_data if system_data.shape[1] == 2 else np.column_stack((system_data, system_data))
+                            self.buffers['system'] = np.vstack((self.buffers['system'], system_stereo))
+                        
+                        mixed = self.mix_audio(mic_data, system_data)
+                        self.buffers['mixed'] = np.vstack((self.buffers['mixed'], mixed))
+                        
+                        for buffer_type in ['mic', 'system', 'mixed']:
+                            self.process_buffer(buffer_type)
+                            
+                    elif self.process_stream == 'mic':
+                        mic_stereo = mic_data if mic_data.shape[1] == 2 else np.column_stack((mic_data, mic_data))
+                        self.buffers['mic'] = np.vstack((self.buffers['mic'], mic_stereo))
+                        self.process_buffer('mic')
+                        
+                    elif self.process_stream == 'system':
+                        system_stereo = system_data if system_data.shape[1] == 2 else np.column_stack((system_data, system_data))
+                        self.buffers['system'] = np.vstack((self.buffers['system'], system_stereo))
+                        self.process_buffer('system')
+                
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"Processing error: {str(e)}")
 
-    def save_segment(self, data):
+    def process_buffer(self, buffer_type):
+        current_duration = len(self.buffers[buffer_type]) / self.sample_rate
+        if current_duration < 0.5:
+            return
+
+        mono_audio = np.mean(self.buffers[buffer_type], axis=1)
+        resampled = librosa.resample(
+            mono_audio.astype(np.float32),
+            orig_sr=self.sample_rate,
+            target_sr=16000
+        )
+
+        result = self.whisper_model.transcribe(resampled, fp16=False)
+        segments = result['segments']
+
+        split_time = None
+        for seg in reversed(segments):
+            end = seg['end'] * (self.sample_rate / 16000)
+            if self.min_split <= end <= self.max_split:
+                split_time = end
+                break
+
+        if not split_time and current_duration >= self.max_split:
+            split_time = self.max_split
+        
+        if split_time:
+            split_sample = int(split_time * self.sample_rate)
+            split_sample = min(split_sample, len(self.buffers[buffer_type]))
+            self.save_segment(self.buffers[buffer_type][:split_sample], buffer_type)
+            self.buffers[buffer_type] = self.buffers[buffer_type][split_sample:]
+
+    def save_segment(self, data, buffer_type):
         max_val = np.max(np.abs(data))
         if max_val > 0:
             normalized_data = data / max_val
@@ -227,14 +270,14 @@ class AudioCapturer:
             
         int_data = (normalized_data * 32767).astype(np.int16)
         
-        filename = f"{self.output_folder}/segment-{self.segment_counter}.wav"
+        filename = f"{self.output_folders[buffer_type]}/segment-{self.segment_counter[buffer_type]}.wav"
         with wave.open(filename, 'wb') as wav_file:
             wav_file.setnchannels(2)
             wav_file.setsampwidth(2)
             wav_file.setframerate(self.sample_rate)
             wav_file.writeframes(int_data.tobytes())
-        print(f"Saved segment: {filename}")
-        self.segment_counter += 1
+        print(f"Saved {buffer_type} segment: {filename}")
+        self.segment_counter[buffer_type] += 1
 
     def start(self):
         self.is_recording = True
@@ -253,22 +296,38 @@ class AudioCapturer:
             
         if self.process_stream in ['system', 'both']:
             if self.os_type == 'Windows':
-                streams.append(sd.InputStream(device=self.system_device,
-                                           channels=self.system_channels,
-                                           samplerate=self.sample_rate,
-                                           callback=self.system_callback,
-                                           blocksize=self.chunk_size,
-                                           extra_settings={'wasapi_loopback': True}))
+                try:
+                    streams.append(sd.InputStream(
+                        device=self.system_device,
+                        channels=self.system_channels,
+                        samplerate=self.sample_rate,
+                        callback=self.system_callback,
+                        blocksize=self.chunk_size,
+                        wasapi_loopback=True
+                    ))
+                except Exception as e:
+                    print(f"Failed to initialize WASAPI loopback: {e}")
+                    print("Falling back to default input...")
+                    streams.append(sd.InputStream(
+                        device=self.system_device,
+                        channels=self.system_channels,
+                        samplerate=self.sample_rate,
+                        callback=self.system_callback,
+                        blocksize=self.chunk_size
+                    ))
             else:
-                streams.append(sd.InputStream(device=self.system_device,
-                                           channels=self.system_channels,
-                                           samplerate=self.sample_rate,
-                                           callback=self.system_callback,
-                                           blocksize=self.chunk_size))
+                streams.append(sd.InputStream(
+                    device=self.system_device,
+                    channels=self.system_channels,
+                    samplerate=self.sample_rate,
+                    callback=self.system_callback,
+                    blocksize=self.chunk_size
+                ))
             
         if streams:
-            with (streams[0] if len(streams) > 0 else contextlib.nullcontext()), \
-                 (streams[1] if len(streams) > 1 else contextlib.nullcontext()):
+            with contextlib.ExitStack() as stack:
+                for stream in streams:
+                    stack.enter_context(stream)
                 print("\nRecording started...")
                 print("Press 'x' and Enter to stop recording...")
                 while self.is_recording:
@@ -280,8 +339,14 @@ class AudioCapturer:
         if hasattr(self, 'processing_thread'):
             self.processing_thread.join()
         with self.lock:
-            if len(self.original_buffer) > 0:
-                self.save_segment(self.original_buffer)
+            if self.process_stream == 'both':
+                for buffer_type in ['mic', 'system', 'mixed']:
+                    if len(self.buffers[buffer_type]) > 0:
+                        self.save_segment(self.buffers[buffer_type], buffer_type)
+            else:
+                buffer_type = self.process_stream
+                if len(self.buffers[buffer_type]) > 0:
+                    self.save_segment(self.buffers[buffer_type], buffer_type)
 
 if __name__ == "__main__":
     try:
