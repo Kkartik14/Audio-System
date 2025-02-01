@@ -34,25 +34,25 @@ class AudioCapturer:
         self.get_split_preferences()
 
     def get_split_preferences(self):
-      while True:
-          try:
-              self.min_split = float(input("Enter minimum split time (seconds, default 5): "))
-              if self.min_split <= 0:
-                  print("Minimum split time must be greater than zero.")
-              else:
-                break
-          except ValueError:
-            print("Invalid input. Please enter a number.")
+        while True:
+            try:
+                self.min_split = float(input("Enter minimum split time (seconds, default 5): "))
+                if self.min_split <= 0:
+                    print("Minimum split time must be greater than zero.")
+                else:
+                    break
+            except ValueError:
+                print("Invalid input. Please enter a number.")
 
-      while True:
-          try:
-              self.max_split = float(input("Enter maximum split time (seconds, default 8): "))
-              if self.max_split <= self.min_split:
-                  print("Maximum split time must be greater than the minimum.")
-              else:
-                break
-          except ValueError:
-              print("Invalid input. Please enter a number.")
+        while True:
+            try:
+                self.max_split = float(input("Enter maximum split time (seconds, default 8): "))
+                if self.max_split <= self.min_split:
+                    print("Maximum split time must be greater than the minimum.")
+                else:
+                    break
+            except ValueError:
+                print("Invalid input. Please enter a number.")
 
     def get_input_devices(self):
         devices = sd.query_devices()
@@ -62,13 +62,20 @@ class AudioCapturer:
                 input_devices.append((i, device))
         return input_devices
 
-    def get_output_devices(self):
-        devices = sd.query_devices()
-        output_devices = []
-        for i, device in enumerate(devices):
-            if device['max_input_channels'] > 0:  
-                output_devices.append((i, device))
-        return output_devices
+    def get_system_audio_device(self):
+        if self.os_type == 'Windows':
+            default_output = sd.default.device[1]
+            device = sd.query_devices(default_output)
+            if device['max_output_channels'] > 0:
+                return default_output, min(2, device['max_output_channels'])
+        else:
+            devices = sd.query_devices()
+            virtual_devices = ['blackhole', 'soundflower']
+            for i, device in enumerate(devices):
+                if any(v in device['name'].lower() for v in virtual_devices):
+                    return i, min(2, device['max_input_channels'])
+        
+        raise RuntimeError("No suitable system audio device found. Please install BlackHole (Mac) or check audio settings (Windows)")
 
     def select_audio_devices(self):
         print("\nAvailable microphone devices:")
@@ -87,23 +94,13 @@ class AudioCapturer:
                     print("Invalid selection. Please try again.")
             except (ValueError, IndexError):
                 print("Invalid input. Try again.")
-
-        print("\nAvailable system audio devices (with loopback capability):")
-        output_devices = self.get_output_devices()
-        for idx, (device_id, device) in enumerate(output_devices):
-            print(f"{idx}: {device['name']} (inputs: {device['max_input_channels']})")
-
-        while True:
-            try:
-                selection = int(input("\nEnter system audio device number: "))
-                if 0 <= selection < len(output_devices):
-                    self.system_device = output_devices[selection][0]
-                    self.system_channels = min(2, output_devices[selection][1]['max_input_channels'])
-                    break
-                else:
-                    print("Invalid selection. Please try again.")
-            except (ValueError, IndexError):
-                print("Invalid input. Try again.")
+        try:
+            self.system_device, self.system_channels = self.get_system_audio_device()
+            device_info = sd.query_devices(self.system_device)
+            print(f"\nAutomatically selected system audio device: {device_info['name']}")
+        except RuntimeError as e:
+            print(f"\nError: {str(e)}")
+            raise
 
     def mic_callback(self, indata, frames, time, status):
         if status:
@@ -116,9 +113,19 @@ class AudioCapturer:
         self.processing_queue.put((indata.copy(), 'system'))
 
     def mix_audio(self, mic_data, system_data):
+        def normalize_audio(audio):
+            max_val = np.max(np.abs(audio))
+            if max_val > 0:
+                return audio / max_val
+            return audio
         mic_stereo = mic_data if mic_data.shape[1] == 2 else np.column_stack((mic_data, mic_data))
         system_stereo = system_data if system_data.shape[1] == 2 else np.column_stack((system_data, system_data))
-        return (system_stereo * 0.7 + mic_stereo * 0.3)
+        mic_stereo = normalize_audio(mic_stereo)
+        system_stereo = normalize_audio(system_stereo)
+        mixed = (system_stereo * 0.5 + mic_stereo * 0.5)
+        gain = 1.2  
+        mixed = mixed * gain
+        return np.clip(mixed, -1.0, 1.0)
 
     def process_audio(self):
         while self.is_processing:
@@ -187,16 +194,30 @@ class AudioCapturer:
         self.is_processing = True
         self.processing_thread = threading.Thread(target=self.process_audio)
         self.processing_thread.start()
+        
+        if self.os_type == 'Windows':
+            system_stream = sd.InputStream(
+                device=self.system_device,
+                channels=self.system_channels,
+                samplerate=self.sample_rate,
+                callback=self.system_callback,
+                blocksize=self.chunk_size,
+                extra_settings={'wasapi_loopback': True}
+            )
+        else:
+            system_stream = sd.InputStream(
+                device=self.system_device,
+                channels=self.system_channels,
+                samplerate=self.sample_rate,
+                callback=self.system_callback,
+                blocksize=self.chunk_size
+            )
+
         with sd.InputStream(device=self.mic_device,
                           channels=self.mic_channels,
                           samplerate=self.sample_rate,
                           callback=self.mic_callback,
-                          blocksize=self.chunk_size), \
-             sd.InputStream(device=self.system_device,
-                          channels=self.system_channels,
-                          samplerate=self.sample_rate,
-                          callback=self.system_callback,
-                          blocksize=self.chunk_size):
+                          blocksize=self.chunk_size), system_stream:
             
             print("\nPress Ctrl+C to stop recording...")
             print("Recording started...")
@@ -227,4 +248,3 @@ if __name__ == "__main__":
         print(f"Error: {str(e)}")
         if 'capturer' in globals():
             capturer.stop()
-
