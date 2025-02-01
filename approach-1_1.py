@@ -56,34 +56,43 @@ class AudioCapturer:
     def get_system_audio_device(self):
         """Automatically select system audio device based on OS"""
         devices = sd.query_devices()
-        
+    
         if self.os_type == 'Windows':
+
             for i, device in enumerate(devices):
                 if device['max_input_channels'] > 0:
                     name = device['name'].lower()
-                    if 'stereo mix' in name or 'what u hear' in name or 'loopback' in name:
+                    if 'stereo mix' in name or 'what u hear' in name:
                         return i, device
-
-            default_output = sd.default.device[1]
-            if default_output is not None:
-                return default_output, devices[default_output]
         
-        elif self.os_type == 'Darwin':  
+            try:
+                default_output = sd.default.device[1]
+                if default_output is not None:
+                    device = devices[default_output].copy()
+                    device['hostapi'] = next(i for i, host in enumerate(sd.query_hostapis()) 
+                                          if host['name'] == 'Windows WASAPI')
+                    device['max_input_channels'] = device.get('max_output_channels', 2)
+                    return default_output, device
+            except Exception as e:
+                print(f"Warning: Could not set up WASAPI loopback: {e}")
+    
+        elif self.os_type == 'Darwin': 
             for i, device in enumerate(devices):
                 if device['max_input_channels'] > 0:
                     name = device['name'].lower()
                     if 'blackhole' in name or 'soundflower' in name:
                         return i, device
-        
+    
         elif self.os_type == 'Linux':
             for i, device in enumerate(devices):
                 if device['max_input_channels'] > 0:
                     name = device['name'].lower()
                     if 'monitor' in name or 'pulse' in name or 'pipewire' in name:
                         return i, device
-        
+    
         default_input = sd.default.device[0]
         return default_input, devices[default_input]
+
     
     def select_audio_devices(self):
         """Let user select microphone and automatically set system audio"""
