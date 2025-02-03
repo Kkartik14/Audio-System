@@ -36,7 +36,7 @@ class AudioCapturer:
     def get_split_preferences(self):
         while True:
             try:
-                self.min_split = float(input("Enter minimum split time (seconds, default 5): "))
+                self.min_split = float(input("Enter minimum split time (seconds, default 5): ") or "5")
                 if self.min_split <= 0:
                     print("Minimum split time must be greater than zero.")
                 else:
@@ -46,7 +46,7 @@ class AudioCapturer:
 
         while True:
             try:
-                self.max_split = float(input("Enter maximum split time (seconds, default 8): "))
+                self.max_split = float(input("Enter maximum split time (seconds, default 8): ") or "8")
                 if self.max_split <= self.min_split:
                     print("Maximum split time must be greater than the minimum.")
                 else:
@@ -63,19 +63,37 @@ class AudioCapturer:
         return input_devices
 
     def get_system_audio_device(self):
-        if self.os_type == 'Windows':
-            default_output = sd.default.device[1]
-            device = sd.query_devices(default_output)
-            if device['max_output_channels'] > 0:
-                return default_output, min(2, device['max_output_channels'])
-        else:
-            devices = sd.query_devices()
-            virtual_devices = ['blackhole', 'soundflower']
-            for i, device in enumerate(devices):
-                if any(v in device['name'].lower() for v in virtual_devices):
-                    return i, min(2, device['max_input_channels'])
+        devices = sd.query_devices()
         
-        raise RuntimeError("No suitable system audio device found. Please install BlackHole (Mac) or check audio settings (Windows)")
+        if self.os_type == 'Windows':
+            # First try to find Stereo Mix
+            for i, device in enumerate(devices):
+                if device['max_input_channels'] > 0:
+                    if 'stereo mix' in device['name'].lower() or 'what u hear' in device['name'].lower():
+                        return i, min(2, device['max_input_channels'])
+            
+            # If Stereo Mix not found, try to use WASAPI loopback via default output device
+            try:
+                default_output = sd.default.device[1]
+                device = sd.query_devices(default_output)
+                if device['max_output_channels'] > 0:
+                    # Set up WASAPI loopback
+                    device_info = device.copy()
+                    device_info['hostapi'] = next(i for i, host in enumerate(sd.query_hostapis()) 
+                                                if host['name'] == 'Windows WASAPI')
+                    return default_output, min(2, device['max_output_channels'])
+            except Exception as e:
+                print(f"Warning: Could not set up WASAPI loopback: {e}")
+        
+        else:  # macOS or Linux
+            virtual_devices = ['blackhole', 'soundflower', 'monitor', 'pulse']
+            for i, device in enumerate(devices):
+                if device['max_input_channels'] > 0:
+                    if any(v in device['name'].lower() for v in virtual_devices):
+                        return i, min(2, device['max_input_channels'])
+        
+        # If no suitable device found, raise error
+        raise RuntimeError("No suitable system audio device found. For Windows, enable Stereo Mix. For Mac, install BlackHole.")
 
     def select_audio_devices(self):
         print("\nAvailable microphone devices:")
@@ -94,6 +112,7 @@ class AudioCapturer:
                     print("Invalid selection. Please try again.")
             except (ValueError, IndexError):
                 print("Invalid input. Try again.")
+        
         try:
             self.system_device, self.system_channels = self.get_system_audio_device()
             device_info = sd.query_devices(self.system_device)
@@ -118,12 +137,15 @@ class AudioCapturer:
             if max_val > 0:
                 return audio / max_val
             return audio
+        
         mic_stereo = mic_data if mic_data.shape[1] == 2 else np.column_stack((mic_data, mic_data))
         system_stereo = system_data if system_data.shape[1] == 2 else np.column_stack((system_data, system_data))
+        
         mic_stereo = normalize_audio(mic_stereo)
         system_stereo = normalize_audio(system_stereo)
+        
         mixed = (system_stereo * 0.5 + mic_stereo * 0.5)
-        gain = 1.2  
+        gain = 1.2
         mixed = mixed * gain
         return np.clip(mixed, -1.0, 1.0)
 
@@ -140,13 +162,16 @@ class AudioCapturer:
                     
                     if mic_data is not None and system_data is not None:
                         break
+                
                 mixed = self.mix_audio(mic_data, system_data)
                 
                 with self.lock:
                     self.original_buffer = np.vstack((self.original_buffer, mixed))
                     current_duration = len(self.original_buffer) / self.sample_rate
-                    if current_duration < 0.5:  
+                    
+                    if current_duration < 0.5:
                         continue
+                        
                     mono_audio = np.mean(self.original_buffer, axis=1)
                     resampled = librosa.resample(
                         mono_audio.astype(np.float32),
@@ -195,19 +220,33 @@ class AudioCapturer:
         self.processing_thread = threading.Thread(target=self.process_audio)
         self.processing_thread.start()
         
+        # Initialize system audio stream based on OS
         if self.os_type == 'Windows':
-            try:
-                system_stream = sd.InputStream(
-                    device=self.system_device,
-                    channels=self.system_channels,
-                    samplerate=self.sample_rate,
-                    callback=self.system_callback,
-                    blocksize=self.chunk_size,
-                    wasapi_loopback=True  # Direct parameter instead of extra_settings
-                )
-            except Exception as e:
-                print(f"Failed to initialize WASAPI loopback: {e}")
-                print("Falling back to default input...")
+            hostapi_info = sd.query_hostapis(sd.default.hostapi)
+            if hostapi_info['name'] == 'Windows WASAPI':
+                extra_settings = {
+                    'channel_map': list(range(self.system_channels)),
+                    'wasapi_exclusive': False
+                }
+                try:
+                    system_stream = sd.InputStream(
+                        device=self.system_device,
+                        channels=self.system_channels,
+                        samplerate=self.sample_rate,
+                        callback=self.system_callback,
+                        blocksize=self.chunk_size,
+                        extra_settings=extra_settings
+                    )
+                except Exception as e:
+                    print(f"Failed to initialize WASAPI settings: {e}")
+                    system_stream = sd.InputStream(
+                        device=self.system_device,
+                        channels=self.system_channels,
+                        samplerate=self.sample_rate,
+                        callback=self.system_callback,
+                        blocksize=self.chunk_size
+                    )
+            else:
                 system_stream = sd.InputStream(
                     device=self.system_device,
                     channels=self.system_channels,
@@ -224,12 +263,13 @@ class AudioCapturer:
                 blocksize=self.chunk_size
             )
 
-        with sd.InputStream(device=self.mic_device,
-                          channels=self.mic_channels,
-                          samplerate=self.sample_rate,
-                          callback=self.mic_callback,
-                          blocksize=self.chunk_size), system_stream:
-            
+        with sd.InputStream(
+            device=self.mic_device,
+            channels=self.mic_channels,
+            samplerate=self.sample_rate,
+            callback=self.mic_callback,
+            blocksize=self.chunk_size
+        ), system_stream:
             print("\nPress Ctrl+C to stop recording...")
             print("Recording started...")
             while self.is_recording:
