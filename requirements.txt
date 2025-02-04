@@ -3,3 +3,5 @@ pydub
 openai-whisper
 ffmpeg-python
 librosa
+groq
+python-dotenv

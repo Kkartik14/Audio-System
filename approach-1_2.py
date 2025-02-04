@@ -11,6 +11,9 @@ import librosa
 import os
 import signal
 import contextlib
+from groq import Groq
+from dotenv import load_dotenv
+load_dotenv()
 
 class AudioCapturer:
     def __init__(self, chunk_duration=3, sample_rate=44100):
@@ -23,9 +26,22 @@ class AudioCapturer:
         self.os_type = platform.system()
         self.segment_counter = 1
 
+        groq_api_key = os.getenv('GROQ_API_KEY')
+        if not groq_api_key:
+            raise ValueError("GROQ_API_KEY not found in environment variables. Please check your .env file.")
+        self.groq_client = Groq(api_key=groq_api_key)
+
         self.chunk_size = int(self.sample_rate * self.chunk_duration)
         self.processing_queue = queue.Queue()
         self.get_stream_preference()
+        self.transcript_file = "transcription.txt"
+        self.summary_file = "summary.txt"
+        self.groq_client = Groq()
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(self.transcript_file, 'w') as f:
+            f.write(f"Recording started at: {current_time}\n\n")
+        with open(self.summary_file, 'w') as f:
+            f.write(f"Summary log started at: {current_time}\n\n")
 
         if self.process_stream == 'both':
             while True:
@@ -54,6 +70,61 @@ class AudioCapturer:
         self.whisper_model = whisper.load_model("tiny")
         self.lock = threading.Lock()
         self.get_split_preferences()
+        self.full_transcript = []
+
+    def write_transcription(self, text, is_split=False):
+        """Write transcription to file with timestamp and print to console"""
+        if text.strip():
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            transcription = f"\n[{timestamp}] {'=== SPLIT === ' if is_split else ''}\n{text.strip()}\n"
+
+            self.full_transcript.append(text.strip())
+
+            with open(self.transcript_file, 'a') as f:
+                f.write(transcription)
+            
+            print(transcription)
+
+    def write_summary(self, text):
+        """Generate and write summary using Groq with full context"""
+        if not text.strip():
+            return
+
+        full_context = " ".join(self.full_transcript)
+        
+        prompt = f"""Please provide a comprehensive summary of the entire conversation so far:
+
+Context: This is an ongoing conversation/speech. Provide a cohesive summary that captures the main points discussed from the beginning until now.
+
+Full Transcript:
+{full_context}
+
+Please provide:
+1. A concise overall summary
+2. Key points discussed
+3. Any significant transitions or changes in topic
+
+Summary:"""
+
+        try:
+            response = self.groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="mixtral-8x7b-32768",
+                temperature=0.3,
+                max_tokens=500  
+            )
+            
+            summary = response.choices[0].message.content.strip()
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            with open(self.summary_file, 'w') as f:
+                f.write(f"Summary log - Last updated at: {timestamp}\n\n")
+                f.write(f"{summary}\n")
+                f.write("-" * 50 + "\n")
+            
+            print(f"\nUpdated Summary at [{timestamp}]:\n{summary}")
+            
+        except Exception as e:
+            print(f"Error generating summary: {str(e)}")
 
     def get_stream_preference(self):
         """Prompt user for a recording stream preference."""
@@ -96,10 +167,7 @@ class AudioCapturer:
         return input_devices
 
     def select_system_audio_device(self):
-        """
-        Select a candidate system audio device. For Windows, attempt to find candidates like 'stereo mix'.
-        For other systems, look for virtual devices.
-        """
+        """Select a system audio device based on OS."""
         devices = sd.query_devices()
         system_candidates = []
         if self.os_type == 'Windows':
@@ -166,10 +234,7 @@ class AudioCapturer:
         self.processing_queue.put((indata.copy(), 'system'))
 
     def mix_audio(self, mic_data, system_data):
-        """
-        Normalize and mix mic and system audio data.
-        Both inputs are forced to stereo if needed.
-        """
+        """Mix mic and system audio data."""
         def normalize_audio(audio):
             max_val = np.max(np.abs(audio))
             return audio / max_val if max_val > 0 else audio
@@ -187,11 +252,7 @@ class AudioCapturer:
         return np.clip(mixed, -1.0, 1.0)
 
     def process_buffer_generic(self, buffer, save_callback):
-        """
-        Process a given buffer: if its duration is sufficient, use Whisper to transcribe,
-        determine a split point, and then save the segment using the provided callback.
-        Returns the remaining buffer after the split.
-        """
+        """Process audio buffer and handle transcription and summarization."""
         current_duration = len(buffer) / self.sample_rate
         if current_duration < 0.5:
             return buffer
@@ -202,9 +263,10 @@ class AudioCapturer:
             orig_sr=self.sample_rate,
             target_sr=16000
         )
+        
         result = self.whisper_model.transcribe(resampled, fp16=False)
+        
         segments = result['segments']
-
         split_time = None
         for seg in reversed(segments):
             end = seg['end'] * (self.sample_rate / 16000)
@@ -218,12 +280,31 @@ class AudioCapturer:
         if split_time:
             split_sample = int(split_time * self.sample_rate)
             split_sample = min(split_sample, len(buffer))
+            
+            split_mono = mono_audio[:split_sample]
+            split_resampled = librosa.resample(
+                split_mono.astype(np.float32),
+                orig_sr=self.sample_rate,
+                target_sr=16000
+            )
+            
+            split_result = self.whisper_model.transcribe(split_resampled, fp16=False)
+            if split_result['text'].strip():
+                self.write_transcription(split_result['text'].strip(), is_split=True)
+                # Generate updated summary after adding new content
+                self.write_summary(split_result['text'].strip())
+            
             save_callback(buffer[:split_sample])
             return buffer[split_sample:]
+        
+        if result['text'].strip():
+            self.write_transcription(result['text'].strip(), is_split=False)
+            
         return buffer
 
+
     def save_segment(self, data):
-        """Save an audio segment (used for single or mixed stream)."""
+        """Save an audio segment."""
         filename = f"{self.output_folder}/segment-{self.segment_counter}.wav"
         int_data = (data * 32767).astype(np.int16)
         with wave.open(filename, 'wb') as wav_file:
@@ -235,7 +316,7 @@ class AudioCapturer:
         self.segment_counter += 1
 
     def save_mic_segment(self, data):
-        """Save a microphone segment to its dedicated folder."""
+        """Save a microphone segment."""
         filename = f"{self.output_folder_mic}/segment-{self.mic_segment_counter}.wav"
         int_data = (data * 32767).astype(np.int16)
         with wave.open(filename, 'wb') as wav_file:
@@ -247,7 +328,7 @@ class AudioCapturer:
         self.mic_segment_counter += 1
 
     def save_system_segment(self, data):
-        """Save a system audio segment to its dedicated folder."""
+        """Save a system audio segment."""
         filename = f"{self.output_folder_system}/segment-{self.system_segment_counter}.wav"
         int_data = (data * 32767).astype(np.int16)
         with wave.open(filename, 'wb') as wav_file:
@@ -259,10 +340,7 @@ class AudioCapturer:
         self.system_segment_counter += 1
 
     def process_audio(self):
-        """
-        Process audio data from the queue, transcribe using Whisper,
-        and save segments when the criteria are met.
-        """
+        """Process audio data from the queue."""
         while self.is_processing:
             try:
                 if self.process_stream == 'both' and self.store_mode == 'mixed':
@@ -279,6 +357,7 @@ class AudioCapturer:
                     with self.lock:
                         self.original_buffer = np.vstack((self.original_buffer, mixed))
                         self.original_buffer = self.process_buffer_generic(self.original_buffer, self.save_segment)
+                        
                 elif self.process_stream == 'both' and self.store_mode == 'separate':
                     data, dtype = self.processing_queue.get(timeout=0.5)
                     with self.lock:
@@ -286,39 +365,27 @@ class AudioCapturer:
                             self.mic_buffer = np.vstack((self.mic_buffer, data))
                         elif dtype == 'system':
                             self.system_buffer = np.vstack((self.system_buffer, data))
+                        
                         mic_len = len(self.mic_buffer)
                         system_len = len(self.system_buffer)
                         min_len = min(mic_len, system_len)
-                        duration = min_len / self.sample_rate
-                        if duration >= 0.5:  
-                            combined_audio = (
+                        
+                        if min_len > 0:
+                            combined_mono = (
                                 np.mean(self.mic_buffer[:min_len], axis=1) +
                                 np.mean(self.system_buffer[:min_len], axis=1)
                             ) / 2
-                            resampled = librosa.resample(
-                                combined_audio.astype(np.float32),
-                                orig_sr=self.sample_rate,
-                                target_sr=16000
-                            )
-                            result = self.whisper_model.transcribe(resampled, fp16=False)
-                            segments = result['segments']
-                            split_time = None
-                            for seg in reversed(segments):
-                                end = seg['end'] * (self.sample_rate / 16000)
-                                if self.min_split <= end <= self.max_split:
-                                    split_time = end
-                                    break
-                            if not split_time and duration >= self.max_split:
-                                split_time = self.max_split
-                            if split_time:
-                                split_sample = int(split_time * self.sample_rate)
-                                split_sample = min(split_sample, min_len)
-                                mic_segment = self.mic_buffer[:split_sample]
-                                system_segment = self.system_buffer[:split_sample]
-                                self.save_mic_segment(mic_segment)
-                                self.save_system_segment(system_segment)
-                                self.mic_buffer = self.mic_buffer[split_sample:]
-                                self.system_buffer = self.system_buffer[split_sample:]
+                            
+                            combined_buffer = np.stack((combined_mono, combined_mono), axis=1)
+                            processed_buffer = self.process_buffer_generic(combined_buffer, lambda x: None)
+                            
+                            if len(processed_buffer) < len(combined_buffer):
+                                split_point = len(combined_buffer) - len(processed_buffer)
+                                self.save_mic_segment(self.mic_buffer[:split_point])
+                                self.save_system_segment(self.system_buffer[:split_point])
+                                self.mic_buffer = self.mic_buffer[split_point:]
+                                self.system_buffer = self.system_buffer[split_point:]
+
                 else:
                     expected_type = self.process_stream
                     while True:
@@ -328,7 +395,7 @@ class AudioCapturer:
                     with self.lock:
                         self.original_buffer = np.vstack((self.original_buffer, data))
                         self.original_buffer = self.process_buffer_generic(self.original_buffer, self.save_segment)
-                        
+
             except queue.Empty:
                 continue
             except Exception as e:
@@ -405,7 +472,8 @@ class AudioCapturer:
             for stream in streams:
                 stack.enter_context(stream)
             print("\nPress Ctrl+C to stop recording...")
-            print("Recording started...")
+            print("Recording started. Transcriptions are being written to transcription.txt")
+            print("Summaries are being written to summary.txt")
             while self.is_recording:
                 time.sleep(0.1)
 
@@ -415,6 +483,13 @@ class AudioCapturer:
         self.is_processing = False
         if hasattr(self, 'processing_thread'):
             self.processing_thread.join()
+
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(self.transcript_file, 'a') as f:
+            f.write(f"\n\nRecording ended at: {current_time}")
+        with open(self.summary_file, 'a') as f:
+            f.write(f"\n\nSummary logging ended at: {current_time}")
+        
         with self.lock:
             if self.process_stream == 'both' and self.store_mode == 'separate':
                 if len(self.mic_buffer) > 0:
@@ -430,7 +505,7 @@ def signal_handler(signum, frame):
     print("\nStopping recording...")
     if 'capturer' in globals():
         capturer.stop()
-    print("Recording stopped. Check audio_segments folder.")
+    print("Recording stopped. Check audio_segments folder, transcription.txt, and summary.txt")
     exit(0)
 
 if __name__ == "__main__":
