@@ -32,5 +32,5 @@ pip install -r requirements.txt
 ### **4. Run the Application**
 Start the program using Streamlit:
 ```bash
-python approach-main.py
+python main.py
 ```
