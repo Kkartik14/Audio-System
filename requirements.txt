@@ -5,3 +5,11 @@ ffmpeg-python
 librosa
 groq
 python-dotenv
+fastapi 
+uvicorn 
+python-multipart 
+moto 
+boto3 
+aiohttp 
+numpy 
+wave 

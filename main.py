@@ -13,6 +13,9 @@ import signal
 import contextlib
 from groq import Groq
 from dotenv import load_dotenv
+import requests
+import mimetypes
+
 load_dotenv()
 
 class AudioCapturer:
@@ -31,17 +34,35 @@ class AudioCapturer:
             raise ValueError("GROQ_API_KEY not found in environment variables. Please check your .env file.")
         self.groq_client = Groq(api_key=groq_api_key)
 
+        sarvam_api_key = os.getenv('SARVAM_API_KEY')  
+        if not sarvam_api_key:
+            raise ValueError("SARVAM_API_KEY not found in environment variables. Please check your .env file.")
+        self.sarvam_api_key = sarvam_api_key
+
+
         self.chunk_size = int(self.sample_rate * self.chunk_duration)
         self.processing_queue = queue.Queue()
         self.get_stream_preference()
+        self.get_language_preference()  
+        self.get_summary_preference()
         self.transcript_file = "transcription.txt"
         self.summary_file = "summary.txt"
+        self.financial_summary_file = "financial_summary.txt"
+        self.tech_summary_file = "tech_summary.txt"
         self.groq_client = Groq()
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(self.transcript_file, 'w') as f:
-            f.write(f"Recording started at: {current_time}\n\n")
-        with open(self.summary_file, 'w') as f:
-            f.write(f"Summary log started at: {current_time}\n\n")
+
+        files_to_initialize = [self.transcript_file]
+        if 'general' in self.summary_types:
+            files_to_initialize.append(self.summary_file)
+        if 'financial' in self.summary_types:
+            files_to_initialize.append(self.financial_summary_file)
+        if 'tech' in self.summary_types:
+            files_to_initialize.append(self.tech_summary_file)
+
+        for file_path in files_to_initialize:
+            with open(file_path, 'w') as f:
+                f.write(f"Recording started at: {current_time}\n\n")
 
         if self.process_stream == 'both':
             while True:
@@ -72,6 +93,53 @@ class AudioCapturer:
         self.get_split_preferences()
         self.full_transcript = []
 
+    def get_language_preference(self):
+        """Prompt user for language preferences."""
+        print("\nEnter the languages you will be speaking, separated by commas (e.g., english, hindi):")
+        while True:
+            try:
+                languages = input("Your choice(s): ").strip().lower()
+                self.languages = [lang.strip() for lang in languages.split(',')]
+                if all(lang for lang in self.languages):
+                    print(f"Selected languages: {', '.join(self.languages)}")
+                    break
+                else:
+                    print("Please enter valid language names.")
+            except Exception as e:
+                print(f"Invalid input. Error: {e}")
+
+
+    def get_summary_preference(self):
+        """Prompt user for summary type preferences."""
+        print("\nWhich types of summaries would you like to generate?")
+        print("1. General summary")
+        print("2. Financial topics summary")
+        print("3. Technical topics summary")
+        print("Enter numbers separated by commas (e.g., 1,2,3 for all types)")
+
+        while True:
+            try:
+                choices = input("Your choice(s): ").strip()
+                selected = [int(x.strip()) for x in choices.split(',')]
+                valid_choices = []
+
+                for choice in selected:
+                    if choice == 1:
+                        valid_choices.append('general')
+                    elif choice == 2:
+                        valid_choices.append('financial')
+                    elif choice == 3:
+                        valid_choices.append('tech')
+
+                if valid_choices:
+                    self.summary_types = valid_choices
+                    print(f"Selected summary types: {', '.join(valid_choices)}")
+                    break
+                else:
+                    print("Please select at least one valid option (1, 2, or 3)")
+            except ValueError:
+                print("Invalid input. Please enter numbers separated by commas")
+
     def write_transcription(self, text, is_split=False):
         """Write transcription to file with timestamp and print to console"""
         if text.strip():
@@ -82,8 +150,9 @@ class AudioCapturer:
 
             with open(self.transcript_file, 'a') as f:
                 f.write(transcription)
-            
+
             print(transcription)
+
 
     def write_summary(self, text):
         """Generate and write summary using Groq with full context"""
@@ -91,8 +160,12 @@ class AudioCapturer:
             return
 
         full_context = " ".join(self.full_transcript)
-        
-        prompt = f"""Please provide a comprehensive summary of the entire conversation so far:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+
+        summaries = {}
+
+        if 'general' in self.summary_types:
+            general_prompt = f"""Please provide a comprehensive summary of the entire conversation so far:
 
 Context: This is an ongoing conversation/speech. Provide a cohesive summary that captures the main points discussed from the beginning until now.
 
@@ -106,25 +179,92 @@ Please provide:
 
 Summary:"""
 
-        try:
             response = self.groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model="mixtral-8x7b-32768",
+                messages=[{"role": "user", "content": general_prompt}],
+                model="llama-3.1-8b-instant",
                 temperature=0.3,
-                max_tokens=500  
+                max_tokens=500
             )
-            
-            summary = response.choices[0].message.content.strip()
-            timestamp = datetime.now().strftime("%H:%M:%S")
+            summaries['general'] = response.choices[0].message.content.strip()
+
             with open(self.summary_file, 'w') as f:
                 f.write(f"Summary log - Last updated at: {timestamp}\n\n")
-                f.write(f"{summary}\n")
+                f.write(f"{summaries['general']}\n")
                 f.write("-" * 50 + "\n")
-            
-            print(f"\nUpdated Summary at [{timestamp}]:\n{summary}")
-            
-        except Exception as e:
-            print(f"Error generating summary: {str(e)}")
+
+            print("\nGeneral Summary:")
+            print(summaries['general'])
+
+        if 'financial' in self.summary_types:
+            financial_prompt = f"""Please analyze the conversation and extract only financial-related topics and discussions:
+
+Full Transcript:
+{full_context}
+
+Focus on topics such as:
+- Money and investments
+- Business finances
+- Financial planning
+- Budgets and costs
+- Revenue and profits
+- Financial markets
+- Economic discussions
+
+Only include financial-related content. If no financial topics were discussed, state that clearly.
+
+Summary:"""
+
+            response = self.groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": financial_prompt}],
+                model="mixtral-8x7b-32768",
+                temperature=0.3,
+                max_tokens=500
+            )
+            summaries['financial'] = response.choices[0].message.content.strip()
+
+            with open(self.financial_summary_file, 'w') as f:
+                f.write(f"Financial Topics Summary - Last updated at: {timestamp}\n\n")
+                f.write(f"{summaries['financial']}\n")
+                f.write("-" * 50 + "\n")
+
+            print("\nFinancial Topics Summary:")
+            print(summaries['financial'])
+
+        if 'tech' in self.summary_types:
+            tech_prompt = f"""Please analyze the conversation and extract only technology project-related topics and discussions:
+
+Full Transcript:
+{full_context}
+
+Focus on topics such as:
+- Software development projects
+- Technical implementations
+- System architecture
+- Project planning and sprints
+- Technical challenges and solutions
+- Development tools and technologies
+- Technical requirements and specifications
+
+Only include technology project-related content. If no tech projects were discussed, state that clearly.
+
+Summary:"""
+
+            response = self.groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": tech_prompt}],
+                model="mixtral-8x7b-32768",
+                temperature=0.3,
+                max_tokens=500
+            )
+            summaries['tech'] = response.choices[0].message.content.strip()
+
+            with open(self.tech_summary_file, 'w') as f:
+                f.write(f"Technology Project Summary - Last updated at: {timestamp}\n\n")
+                f.write(f"{summaries['tech']}\n")
+                f.write("-" * 50 + "\n")
+
+            print("\nTechnology Project Summary:")
+            print(summaries['tech'])
+
 
     def get_stream_preference(self):
         """Prompt user for a recording stream preference."""
@@ -238,18 +378,64 @@ Summary:"""
         def normalize_audio(audio):
             max_val = np.max(np.abs(audio))
             return audio / max_val if max_val > 0 else audio
-        
+
         if mic_data.shape[1] != 2:
             mic_data = np.column_stack((mic_data, mic_data))
         if system_data.shape[1] != 2:
             system_data = np.column_stack((system_data, system_data))
-        
+
         mic_stereo = normalize_audio(mic_data)
         system_stereo = normalize_audio(system_data)
         mixed = (system_stereo * 0.5 + mic_stereo * 0.5)
         gain = 1.2
         mixed = mixed * gain
         return np.clip(mixed, -1.0, 1.0)
+
+    def sarvam_speech_to_text(self, audio_file_path, model='saaras:v2', prompt=None, with_diarization=False):
+        """
+        Convert speech to text using Sarvam AI's Speech-to-Text Translate API
+
+        :param audio_file_path: Path to the audio file (.wav or .mp3)
+        :param model: Speech-to-text model version (default: saaras:v2)
+        :param prompt: Optional conversation context (experimental)
+        :param with_diarization: Enable speaker diarization (default: False)
+        :return: API response
+        """
+        url = "https://api.sarvam.ai/speech-to-text-translate"
+
+        if not os.path.exists(audio_file_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_file_path}")
+
+        mime_type, _ = mimetypes.guess_type(audio_file_path)
+        if mime_type not in ['audio/mpeg', 'audio/wav', 'audio/wave', 'audio/x-wav']:
+            raise ValueError(f"Unsupported audio file type: {mime_type}")
+
+        with open(audio_file_path, 'rb') as audio_file:
+            files = {
+                'file': (os.path.basename(audio_file_path), audio_file, mime_type)
+            }
+
+            data = {
+                'model': model,
+                'with_diarization': str(with_diarization)
+            }
+
+            if prompt:
+                data['prompt'] = prompt
+
+            headers = {
+                'api-subscription-key': self.sarvam_api_key  
+            }
+            print(f"Sarvam API Key: {self.sarvam_api_key}") 
+
+            response = requests.post(url, files=files, data=data, headers=headers)
+
+        if response.status_code == 200:
+            return response.json()
+        else:
+            raise Exception(f"API request failed with status code {response.status_code}: {response.text}")
+
+
 
     def process_buffer_generic(self, buffer, save_callback):
         """Process audio buffer and handle transcription and summarization."""
@@ -263,11 +449,12 @@ Summary:"""
             orig_sr=self.sample_rate,
             target_sr=16000
         )
-        
+
         result = self.whisper_model.transcribe(resampled, fp16=False)
-        
+        detected_language = result.get('language', '').lower()
         segments = result['segments']
         split_time = None
+
         for seg in reversed(segments):
             end = seg['end'] * (self.sample_rate / 16000)
             if self.min_split <= end <= self.max_split:
@@ -280,27 +467,60 @@ Summary:"""
         if split_time:
             split_sample = int(split_time * self.sample_rate)
             split_sample = min(split_sample, len(buffer))
-            
-            split_mono = mono_audio[:split_sample]
-            split_resampled = librosa.resample(
-                split_mono.astype(np.float32),
-                orig_sr=self.sample_rate,
-                target_sr=16000
-            )
-            
-            split_result = self.whisper_model.transcribe(split_resampled, fp16=False)
-            if split_result['text'].strip():
-                self.write_transcription(split_result['text'].strip(), is_split=True)
-                # Generate updated summary after adding new content
-                self.write_summary(split_result['text'].strip())
-            
-            save_callback(buffer[:split_sample])
+            temp_file = os.path.join(self.output_folder, "temp_split.wav")  
+            print(f"Temp file path: {temp_file}") 
+
+            split_data = buffer[:split_sample]
+            int_split_data = (split_data * 32767).astype(np.int16)
+
+            with wave.open(temp_file, 'wb') as wf:
+                wf.setnchannels(2)
+                wf.setsampwidth(2)
+                wf.setframerate(self.sample_rate)
+                wf.writeframes(int_split_data.tobytes())
+            wf.close() 
+            time.sleep(0.1) 
+
+            print(f"Temp file exists: {os.path.exists(temp_file)}") 
+            print(f"Detected Language: {detected_language}, Selected Languages: {self.languages}") 
+
+            if detected_language not in ['en', 'english'] and detected_language in self.languages:
+                try:
+                    sarvam_result = self.sarvam_speech_to_text(temp_file)
+                    translated_text = sarvam_result.get('transcript')
+                    if translated_text:
+                         self.write_transcription(translated_text, is_split=True)
+                         self.write_summary(translated_text)
+
+                except Exception as e:
+                    print(f"Sarvam AI Error: {e}")
+                    split_mono = mono_audio[:split_sample]
+                    split_resampled = librosa.resample(split_mono.astype(np.float32), orig_sr=self.sample_rate, target_sr=16000)
+                    split_result = self.whisper_model.transcribe(split_resampled, fp16=False)
+                    if split_result['text'].strip():
+                       self.write_transcription(split_result['text'].strip(), is_split=True)
+                       self.write_summary(split_result['text'].strip())
+            else:
+                split_mono = mono_audio[:split_sample]
+                split_resampled = librosa.resample(
+                    split_mono.astype(np.float32),
+                    orig_sr=self.sample_rate,
+                    target_sr=16000
+                )
+                split_result = self.whisper_model.transcribe(split_resampled, fp16=False)
+                if split_result['text'].strip():
+                    self.write_transcription(split_result['text'].strip(), is_split=True)
+                    self.write_summary(split_result['text'].strip())
+
+            os.remove(temp_file)
+            save_callback(buffer[:split_sample])  
             return buffer[split_sample:]
-        
+
         if result['text'].strip():
-            self.write_transcription(result['text'].strip(), is_split=False)
-            
+            self.write_transcription(result['text'].strip())
         return buffer
+
+
 
 
     def save_segment(self, data):
@@ -357,7 +577,7 @@ Summary:"""
                     with self.lock:
                         self.original_buffer = np.vstack((self.original_buffer, mixed))
                         self.original_buffer = self.process_buffer_generic(self.original_buffer, self.save_segment)
-                        
+
                 elif self.process_stream == 'both' and self.store_mode == 'separate':
                     data, dtype = self.processing_queue.get(timeout=0.5)
                     with self.lock:
@@ -365,20 +585,20 @@ Summary:"""
                             self.mic_buffer = np.vstack((self.mic_buffer, data))
                         elif dtype == 'system':
                             self.system_buffer = np.vstack((self.system_buffer, data))
-                        
+
                         mic_len = len(self.mic_buffer)
                         system_len = len(self.system_buffer)
                         min_len = min(mic_len, system_len)
-                        
+
                         if min_len > 0:
                             combined_mono = (
                                 np.mean(self.mic_buffer[:min_len], axis=1) +
                                 np.mean(self.system_buffer[:min_len], axis=1)
                             ) / 2
-                            
+
                             combined_buffer = np.stack((combined_mono, combined_mono), axis=1)
                             processed_buffer = self.process_buffer_generic(combined_buffer, lambda x: None)
-                            
+
                             if len(processed_buffer) < len(combined_buffer):
                                 split_point = len(combined_buffer) - len(processed_buffer)
                                 self.save_mic_segment(self.mic_buffer[:split_point])
@@ -407,7 +627,7 @@ Summary:"""
         self.is_processing = True
         self.processing_thread = threading.Thread(target=self.process_audio)
         self.processing_thread.start()
-        
+
         system_stream = None
         if self.process_stream in ['system', 'both']:
             if self.os_type == 'Windows':
@@ -485,11 +705,19 @@ Summary:"""
             self.processing_thread.join()
 
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(self.transcript_file, 'a') as f:
-            f.write(f"\n\nRecording ended at: {current_time}")
-        with open(self.summary_file, 'a') as f:
-            f.write(f"\n\nSummary logging ended at: {current_time}")
-        
+
+        files_to_update = [self.transcript_file]
+        if 'general' in self.summary_types:
+            files_to_update.append(self.summary_file)
+        if 'financial' in self.summary_types:
+            files_to_update.append(self.financial_summary_file)
+        if 'tech' in self.summary_types:
+            files_to_update.append(self.tech_summary_file)
+
+        for file_path in files_to_update:
+            with open(file_path, 'a') as f:
+                f.write(f"\n\nRecording ended at: {current_time}")
+
         with self.lock:
             if self.process_stream == 'both' and self.store_mode == 'separate':
                 if len(self.mic_buffer) > 0:
